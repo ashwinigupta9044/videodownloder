@@ -2,7 +2,7 @@
 """
 Telegram Video Downloader Bot (Python + yt-dlp)
 ------------------------------------------------
-Auto-patch for Python 3.13 (imghdr removed)
+Fix for Python 3.13 + telegram library issues
 """
 
 # --- Patch for Python 3.13 imghdr removal ---
@@ -25,6 +25,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+# --- Force vendored urllib3 issue fix ---
+try:
+    import urllib3
+except ImportError:
+    os.system("pip install urllib3==2.0.7 six")
+    import urllib3
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -103,7 +110,6 @@ async def download_and_send(url: str, update: Update, context: ContextTypes.DEFA
     log.info("Downloading: %s", url)
 
     async def progress_hook(d):
-        # Called by yt-dlp in a thread; schedule coroutine for Telegram edits.
         if d.get('status') == 'downloading':
             p = d.get('downloaded_bytes', 0)
             t = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
@@ -118,7 +124,7 @@ async def download_and_send(url: str, update: Update, context: ContextTypes.DEFA
         'outtmpl': out_tpl,
         'noprogress': False,
         'progress_hooks': [progress_hook],
-        'format': 'bv*+ba/b',  # best video+audio, else best
+        'format': 'bv*+ba/b',
         'merge_output_format': 'mp4',
         'postprocessors': [
             {'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}
@@ -130,13 +136,12 @@ async def download_and_send(url: str, update: Update, context: ContextTypes.DEFA
 
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        # Create an initial progress message
         sent = await update.message.reply_text("⏳ Starting download...")
         job.progress_msg_id = sent.message_id
 
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(None, lambda: _ydl_extract(ydl_opts, url))
-        # Send the first resulting file we can find
+
         files = sorted(tmpdir.glob("*"))
         video_path = None
         for f in files:
@@ -155,7 +160,6 @@ async def download_and_send(url: str, update: Update, context: ContextTypes.DEFA
 
         await edit_progress(update, context, job, "📤 Uploading to Telegram...")
 
-        # Try sending as video first (nicer preview). Fall back to document.
         try:
             with video_path.open('rb') as fh:
                 await context.bot.send_video(
@@ -179,7 +183,6 @@ async def download_and_send(url: str, update: Update, context: ContextTypes.DEFA
         log.exception("Download error")
         await update.message.reply_text(f"❌ Error: {e}")
     finally:
-        # Cleanup temp files
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception:
@@ -187,18 +190,15 @@ async def download_and_send(url: str, update: Update, context: ContextTypes.DEFA
 
 
 def _ydl_extract(opts, url):
-    """Blocking helper to run yt-dlp download & return info dict."""
     from yt_dlp import YoutubeDL
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         if info.get('_type') == 'playlist' and info.get('entries'):
-            # download=True will still save files; pick first entry meta to caption
             info = info['entries'][0]
         return info
 
 
 async def edit_progress(update: Update, context: ContextTypes.DEFAULT_TYPE, job: JobState, text: str):
-    """Rate-limit progress edits to avoid flood limits."""
     import time
     now = time.monotonic()
     if job.progress_msg_id is None:
@@ -216,7 +216,6 @@ async def edit_progress(update: Update, context: ContextTypes.DEFAULT_TYPE, job:
         )
         job.last_edit_ts = now
     except Exception as e:
-        # Ignore edit errors (e.g., message not modified or too old)
         log.debug("edit_progress ignored: %s", e)
 
 
