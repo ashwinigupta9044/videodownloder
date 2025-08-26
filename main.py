@@ -1,88 +1,253 @@
-import os
-import yt_dlp
+#!/usr/bin/env python3
+"""
+Telegram Video Downloader Bot (Python + yt-dlp)
+------------------------------------------------
+Features
+- Paste any supported URL (YouTube, Instagram*, TikTok*, Twitter/X, etc.) and the bot downloads via yt-dlp
+- Progress updates while downloading
+- Auto-picks best quality (within Telegram limits)
+- Sends as video (MP4) or as a general file (document) if needed
+- Basic size safety checks & clear errors
+
+⚠️ Legal/TOS note: Only download content you have rights to. Many platforms prohibit downloading without permission.
+
+Prerequisites
+- Python 3.10+
+- pip install -r requirements.txt
+  requirements: python-telegram-bot~=21.6, yt-dlp>=2025.1.1, aiofiles
+- Set env var: BOT_TOKEN="123456:ABC..."  (BotFather token)
+
+Run
+- python main.py
+
+*Instagram/TikTok may require yt-dlp to be current; keep it updated.
+"""
+
+import asyncio
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import os
+import re
+import shutil
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    Application, ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-BOT_TOKEN = os.environ['BOT_TOKEN']
-user_links = {}
+# --- Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("video_bot")
 
-# /start command
+# --- Config ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+MAX_UPLOAD_BYTES = 1_950_000_000  # ~1.95 GB safety
+PROGRESS_EDIT_INTERVAL = 2.5  # seconds between progress message edits
+
+# Accept most URLs; yt-dlp handles site support.
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+@dataclass
+class JobState:
+    last_edit_ts: float = 0.0
+    progress_msg_id: Optional[int] = None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎬 Send a YouTube/video link to choose quality and download.")
+    text = (
+        "👋 *Video Downloader Bot*\n\n"
+        "Bas link bhejo, main download karke yahin bhej dunga.\n\n"
+        "*Commands*:\n"
+        "• /start – help\n"
+        "• /help – usage & tips\n\n"
+        "⚠️ Sirf wahi content download karein jiska aapko haq hai."
+    )
+    await update.message.reply_markdown(text)
 
-# Handle video link
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text
-    user_id = update.effective_user.id
-    user_links[user_id] = url
 
-    buttons = [
-        [InlineKeyboardButton("🔊 Audio", callback_data='audio')],
-        [InlineKeyboardButton("📱 360p", callback_data='360p')],
-        [InlineKeyboardButton("🖥️ 720p", callback_data='720p')],
-        [InlineKeyboardButton("🎞️ Best", callback_data='best')],
-    ]
-    reply_markup = InlineKeyboardMarkup(buttons)
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "*Kaise use karein*\n\n"
+        "1) YouTube/TikTok/Instagram/X ka URL paste karein.\n"
+        "2) Bot progress dikhayega.\n"
+        "3) Video ready hote hi bhej diya jayega.\n\n"
+        "*Notes*\n"
+        "• Badi files (> ~1.95GB) send nahi hongi.\n"
+        "• Kuch sites ke liye yt-dlp ka latest version hona zaroori hai.\n"
+        "• Private/age-gated content download nahi hoga."
+    )
+    await update.message.reply_markdown(text)
 
-    await update.message.reply_text("📥 Choose format to download:", reply_markup=reply_markup)
 
-# Handle button press
-async def format_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    urls = URL_RE.findall(msg.text)
+    if not urls:
+        await msg.reply_text("Kripya ek valid video URL bhejein.")
+        return
 
-    format_choice = query.data
-    user_id = query.from_user.id
-    url = user_links.get(user_id)
+    url = urls[0]
+    await download_and_send(url, update, context)
 
-    await query.edit_message_text(f"⏳ Downloading {format_choice.upper()}...")
+
+async def download_and_send(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from yt_dlp import YoutubeDL  # local import so bot can start even if yt-dlp missing
+
+    job = JobState()
+    chat_id = update.effective_chat.id
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="dl_"))
+    out_tpl = str(tmpdir / "%(title).80s-%(id)s.%(ext)s")
+    log.info("Downloading: %s", url)
+
+    async def progress_hook(d):
+        # Called by yt-dlp in a thread; schedule coroutine for Telegram edits.
+        if d.get('status') == 'downloading':
+            p = d.get('downloaded_bytes', 0)
+            t = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            speed = d.get('speed') or 0
+            pct = (p / t * 100) if t else 0
+            text = f"⬇️ Downloading... {pct:.1f}%\n{p/1e6:.1f} / {t/1e6:.1f} MB\n{speed/1e6:.1f} MB/s"
+            asyncio.get_event_loop().create_task(edit_progress(update, context, job, text))
+        elif d.get('status') == 'finished':
+            asyncio.get_event_loop().create_task(edit_progress(update, context, job, "✅ Download complete. Processing..."))
 
     ydl_opts = {
-        'outtmpl': 'video.%(ext)s',
+        'outtmpl': out_tpl,
+        'noprogress': False,
+        'progress_hooks': [progress_hook],
+        'format': 'bv*+ba/b',  # best video+audio, else best
+        'merge_output_format': 'mp4',
+        'postprocessors': [
+            {'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}
+        ],
+        'quiet': True,
+        'no_warnings': True,
+        'retries': 3,
     }
 
-    if format_choice == 'audio':
-        ydl_opts['format'] = 'bestaudio'
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }]
-    elif format_choice == '360p':
-        ydl_opts['format'] = 'best[height<=360]'
-    elif format_choice == '720p':
-        ydl_opts['format'] = 'best[height<=720]'
-    else:
-        ydl_opts['format'] = 'best'
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        # Create an initial progress message
+        sent = await update.message.reply_text("⏳ Starting download...")
+        job.progress_msg_id = sent.message_id
 
-        if format_choice == 'audio':
-            filename = filename.rsplit('.', 1)[0] + ".mp3"
-            await query.message.reply_audio(audio=open(filename, 'rb'))
-        else:
-            await query.message.reply_video(video=open(filename, 'rb'))
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(None, lambda: _ydl_extract(ydl_opts, url))
+        # Send the first resulting file we can find
+        files = sorted(tmpdir.glob("*"))
+        video_path = None
+        for f in files:
+            if f.suffix.lower() in {'.mp4', '.mkv', '.webm', '.mov'}:
+                video_path = f
+                break
+        if not video_path:
+            raise FileNotFoundError("Converted video not found.")
 
-        os.remove(filename)
+        size = video_path.stat().st_size
+        if size > MAX_UPLOAD_BYTES:
+            await update.message.reply_text(
+                f"❌ File bahut badi hai (≈ {size/1e9:.2f} GB). 2GB se chhoti link bhejein ya quality kam karein."
+            )
+            return
+
+        await edit_progress(update, context, job, "📤 Uploading to Telegram...")
+
+        # Try sending as video first (nicer preview). Fall back to document.
+        try:
+            with video_path.open('rb') as fh:
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=fh,
+                    caption=f"✅ Done\nTitle: {info.get('title', 'Video')}\nSource: {url}",
+                    supports_streaming=True,
+                )
+        except Exception as e:
+            log.warning("send_video failed, retrying as document: %s", e)
+            with video_path.open('rb') as fh:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=fh,
+                    caption=f"✅ Done (as file)\nTitle: {info.get('title', 'Video')}\nSource: {url}",
+                )
+
+        await edit_progress(update, context, job, "🎉 Finished!")
 
     except Exception as e:
-        await query.message.reply_text(f"❌ Error: {str(e)}")
+        log.exception("Download error")
+        await update.message.reply_text(f"❌ Error: {e}")
+    finally:
+        # Cleanup temp files
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
-# Build application
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_url))
-app.add_handler(CallbackQueryHandler(format_choice))
 
-app.run_polling()
+def _ydl_extract(opts, url):
+    """Blocking helper to run yt-dlp download & return info dict."""
+    from yt_dlp import YoutubeDL
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info.get('_type') == 'playlist' and info.get('entries'):
+            # download=True will still save files; pick first entry meta to caption
+            info = info['entries'][0]
+        return info
+
+
+async def edit_progress(update: Update, context: ContextTypes.DEFAULT_TYPE, job: JobState, text: str):
+    """Rate-limit progress edits to avoid flood limits."""
+    import time
+    now = time.monotonic()
+    if job.progress_msg_id is None:
+        m = await update.message.reply_text(text)
+        job.progress_msg_id = m.message_id
+        job.last_edit_ts = now
+        return
+    if now - job.last_edit_ts < PROGRESS_EDIT_INTERVAL:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=job.progress_msg_id,
+            text=text
+        )
+        job.last_edit_ts = now
+    except Exception as e:
+        # Ignore edit errors (e.g., message not modified or too old)
+        log.debug("edit_progress ignored: %s", e)
+
+
+async def main():
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN env var not set")
+
+    app: Application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    log.info("Bot started")
+    await app.run_polling(close_loop=False)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
