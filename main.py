@@ -10,7 +10,7 @@ from telegram.ext import (
     filters,
 )
 
-BOT_TOKEN = os.environ['']
+BOT_TOKEN = os.environ['BOT_TOKEN']
 user_links = {}
 
 # /start command
