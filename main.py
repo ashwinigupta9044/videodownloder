@@ -2,26 +2,19 @@
 """
 Telegram Video Downloader Bot (Python + yt-dlp)
 ------------------------------------------------
-Features
-- Paste any supported URL (YouTube, Instagram*, TikTok*, Twitter/X, etc.) and the bot downloads via yt-dlp
-- Progress updates while downloading
-- Auto-picks best quality (within Telegram limits)
-- Sends as video (MP4) or as a general file (document) if needed
-- Basic size safety checks & clear errors
-
-⚠️ Legal/TOS note: Only download content you have rights to. Many platforms prohibit downloading without permission.
-
-Prerequisites
-- Python 3.10+
-- pip install -r requirements.txt
-  requirements: python-telegram-bot~=21.6, yt-dlp>=2025.1.1, aiofiles
-- Set env var: BOT_TOKEN="123456:ABC..."  (BotFather token)
-
-Run
-- python main.py
-
-*Instagram/TikTok may require yt-dlp to be current; keep it updated.
+Auto-patch for Python 3.13 (imghdr removed)
 """
+
+# --- Patch for Python 3.13 imghdr removal ---
+try:
+    import imghdr  # noqa
+except ModuleNotFoundError:
+    import types, sys
+    imghdr = types.ModuleType("imghdr")
+    def what(file, h=None):
+        return None
+    imghdr.what = what
+    sys.modules["imghdr"] = imghdr
 
 import asyncio
 import logging
