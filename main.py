@@ -1,5 +1,6 @@
 import os
 import yt_dlp
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
